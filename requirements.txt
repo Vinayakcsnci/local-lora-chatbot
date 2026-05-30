@@ -1,0 +1,9 @@
+transformers>=4.48.0
+peft>=0.14.0
+trl>=0.13.0
+datasets>=3.2.0
+accelerate>=1.2.0
+gradio>=6.0.0
+pypdf>=4.0.0
+requests>=2.31.0
+torch>=2.0.0
