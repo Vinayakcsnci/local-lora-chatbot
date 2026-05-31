@@ -15,10 +15,14 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 from trl import SFTConfig, SFTTrainer
 
 # ── Config ────────────────────────────────────────────────────────────────────
-OLLAMA_URL   = "http://localhost:11434"
-OLLAMA_MODEL = "mistral:latest"          # for Q&A generation
-BASE_MODEL   = "HuggingFaceTB/SmolLM2-135M-Instruct"
-MODELS_DIR   = os.path.join(os.path.dirname(__file__), "models")
+OLLAMA_URL        = "http://localhost:11434"
+OLLAMA_MODEL      = "llama3.2:latest"    # 2 GB — ~2× faster than mistral on CPU
+BASE_MODEL        = "HuggingFaceTB/SmolLM2-135M-Instruct"
+MODELS_DIR        = os.path.join(os.path.dirname(__file__), "models")
+OLLAMA_TIMEOUT    = 300                  # seconds per chunk (5 min — generous for CPU)
+QA_CHUNK_CHARS    = 800                  # shorter chunks → faster Ollama response
+QA_PER_CHUNK      = 3                    # pairs per chunk
+MAX_CHUNKS        = 12                   # cap total chunks processed
 os.makedirs(MODELS_DIR, exist_ok=True)
 
 # ── Shared state ──────────────────────────────────────────────────────────────
@@ -78,28 +82,37 @@ def _parse_qa(text: str) -> list[dict]:
     return pairs
 
 
-def generate_qa(pages: list[str], n: int = 4) -> list[dict]:
-    pairs = []
-    for chunk in pages[:8]:
+def generate_qa(pages: list[str]) -> list[dict]:
+    pairs   = []
+    chunks  = pages[:MAX_CHUNKS]
+    total   = len(chunks)
+    for idx, chunk in enumerate(chunks, 1):
+        _log_q.put(f"  Q&A chunk {idx}/{total} ({len(chunk)} chars)...")
         prompt = (
-            f"Read the text below and write {n} question-answer pairs.\n"
+            f"Read the text below and write {QA_PER_CHUNK} question-answer pairs.\n"
             "Output ONLY this format, nothing else:\n"
             "Q: <question>\nA: <answer>\n\n"
-            f"TEXT:\n{chunk[:1500]}\n\nQ&A pairs:"
+            f"TEXT:\n{chunk[:QA_CHUNK_CHARS]}\n\nQ&A pairs:"
         )
         try:
             r = requests.post(
                 f"{OLLAMA_URL}/api/generate",
                 json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
-                timeout=90,
+                timeout=OLLAMA_TIMEOUT,
             )
-            out = r.json().get("response", "")
+            out         = r.json().get("response", "")
             chunk_pairs = _parse_qa(out)
             pairs.extend(chunk_pairs)
+            _log_q.put(f"    → {len(chunk_pairs)} pair(s) (total so far: {len(pairs)})")
             if not chunk_pairs:
-                _log_q.put(f"[warn] No pairs parsed from chunk. Raw: {out[:100]!r}")
+                _log_q.put(f"    [warn] No pairs parsed. Raw: {out[:80]!r}")
+        except requests.exceptions.Timeout:
+            _log_q.put(
+                f"    [warn] Chunk {idx} timed out after {OLLAMA_TIMEOUT}s — skipping. "
+                f"Consider using a smaller model or reducing QA_CHUNK_CHARS."
+            )
         except Exception as e:
-            _log_q.put(f"[warn] Q&A gen chunk failed: {e}")
+            _log_q.put(f"    [warn] Chunk {idx} failed: {e}")
     return pairs
 
 
@@ -150,7 +163,10 @@ def _worker(all_pdf_bytes: list[bytes], project_name: str):
         _log_q.put(f"Total: {len(pages)} page(s) across {len(all_pdf_bytes)} file(s).")
 
         # 2. Q&A via Ollama
-        _log_q.put(f"Generating Q&A pairs with Ollama ({OLLAMA_MODEL})...")
+        _log_q.put(
+            f"Generating Q&A pairs with Ollama ({OLLAMA_MODEL}) — "
+            f"timeout {OLLAMA_TIMEOUT}s/chunk, {QA_CHUNK_CHARS} chars/chunk..."
+        )
         pairs = generate_qa(pages)
         _state["qa_count"] = len(pairs)
         if not pairs:
@@ -363,7 +379,8 @@ with gr.Blocks(title="Local LoRA Chatbot") as demo:
     gr.Markdown(
         "# Local LoRA Q&A Chatbot\n"
         "**PDF → Ollama Q&A generation → LoRA fine-tune SmolLM2-135M (CPU) → chat**\n\n"
-        f"Q&A model: `{OLLAMA_MODEL}` | Train model: `{BASE_MODEL}`"
+        f"Q&A model: `{OLLAMA_MODEL}` ({OLLAMA_TIMEOUT}s timeout, {QA_CHUNK_CHARS} chars/chunk) | "
+        f"Train model: `{BASE_MODEL}`"
     )
 
     with gr.Tabs() as tabs:
