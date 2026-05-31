@@ -261,6 +261,20 @@ def _drain_logs():
     _state["log_lines"] = _state["log_lines"][-120:]
 
 
+# ── Model discovery ───────────────────────────────────────────────────────────
+
+def list_models() -> list[str]:
+    """Return names of completed fine-tuned models in MODELS_DIR."""
+    if not os.path.isdir(MODELS_DIR):
+        return []
+    return sorted(
+        d for d in os.listdir(MODELS_DIR)
+        if not d.startswith("_")                                   # exclude tmp dirs
+        and os.path.isdir(os.path.join(MODELS_DIR, d))
+        and os.path.exists(os.path.join(MODELS_DIR, d, "config.json"))
+    )
+
+
 # ── Chat inference ─────────────────────────────────────────────────────────────
 
 def _load_model(path: str):
@@ -273,10 +287,15 @@ def _load_model(path: str):
     return model, tok
 
 
-def chat_fn(message: str, history: list[dict]):
-    path = _state.get("model_path")
-    if not path or not os.path.exists(path):
-        yield "Model is not ready — complete training first (Step 2 tab)."
+def chat_fn(message: str, history: list[dict], selected_model: str | None = None):
+    # Prefer dropdown selection; fall back to last trained model
+    name = selected_model or _state.get("project_name")
+    if not name:
+        yield "No model selected — train one (Step 1) or pick one from the dropdown."
+        return
+    path = os.path.join(MODELS_DIR, name)
+    if not os.path.exists(os.path.join(path, "config.json")):
+        yield f"Model '{name}' not found in {MODELS_DIR}. Train it first."
         return
 
     model, tok = _load_model(path)
@@ -351,25 +370,32 @@ def get_progress():
     prog_bar = f"[{'#' * (pct // 5)}{' ' * (20 - pct // 5)}] {pct}%"
 
     if err:
-        status = f"ERROR: {err}"
-        ready  = False
+        status        = f"ERROR: {err}"
+        ready         = False
+        dropdown_upd  = gr.update()
     elif phase == "upload":
-        status = "Idle — upload PDF(s) to begin."
-        ready  = False
+        status        = "Idle — upload PDF(s) to begin."
+        ready         = False
+        dropdown_upd  = gr.update()
     elif phase == "training":
         status = (
             f"Training `{BASE_MODEL}` on {_state['qa_count']} Q&A pairs\n"
             f"{prog_bar}\n"
             f"Step {_state['current_step']}/{_state['total_steps']}"
         )
-        ready = False
+        ready        = False
+        dropdown_upd = gr.update()
     elif phase == "chat":
-        status = f"Done! Model saved to {_state['model_path']}"
-        ready  = True
+        status       = f"Done! Model saved to {_state['model_path']}"
+        ready        = True
+        # Auto-populate + select the freshly trained model in the dropdown
+        models       = list_models()
+        new_name     = _state.get("project_name")
+        dropdown_upd = gr.update(choices=models, value=new_name if new_name in models else (models[0] if models else None))
     else:
-        status, ready = "", False
+        status, ready, dropdown_upd = "", False, gr.update()
 
-    return status, logs, gr.update(visible=ready)
+    return status, logs, gr.update(visible=ready), dropdown_upd
 
 
 # ── UI ─────────────────────────────────────────────────────────────────────────
@@ -416,14 +442,31 @@ with gr.Blocks(title="Local LoRA Chatbot") as demo:
         # Tab 3 — Chat
         with gr.Tab("Step 3 — Chat", id="chat"):
             gr.Markdown(
-                "Ask questions about your document. "
-                "The model was fine-tuned on Q&A pairs extracted from your PDF."
+                "Select a fine-tuned model from the dropdown, then ask questions. "
+                "The model was trained on Q&A pairs extracted from your PDF(s)."
             )
+            # Model selector row — sits above the chat interface
+            with gr.Row():
+                model_dropdown = gr.Dropdown(
+                    label="Fine-tuned model",
+                    choices=list_models(),
+                    value=None,
+                    interactive=True,
+                    scale=4,
+                )
+                refresh_models_btn = gr.Button("Refresh", size="sm", scale=1)
+
+            # gr.State holds the selected model name and is passed as additional input
+            model_state = gr.State(None)
+
             chatbot = gr.ChatInterface(
                 fn=chat_fn,
-                chatbot=gr.Chatbot(height=460),
+                additional_inputs=[model_state],
+                chatbot=gr.Chatbot(height=400),
                 textbox=gr.Textbox(
-                    placeholder="Ask a question...", container=False
+                    placeholder="Ask a question...",
+                    container=False,
+                    submit_btn="Enter",
                 ),
             )
             reset_btn = gr.Button("Train a new model")
@@ -438,8 +481,24 @@ with gr.Blocks(title="Local LoRA Chatbot") as demo:
     open_btn.click(fn=lambda: gr.update(selected="chat"), outputs=[tabs])
     reset_btn.click(fn=lambda: gr.update(selected="upload"), outputs=[tabs])
 
-    refresh_fn = lambda: get_progress()
-    gr.Timer(10).tick(fn=refresh_fn, outputs=[status_box, log_box, open_btn])
+    # Dropdown → State (so ChatInterface fn receives the selection)
+    model_dropdown.change(
+        fn=lambda v: v,
+        inputs=[model_dropdown],
+        outputs=[model_state],
+    )
+
+    # Refresh button re-scans MODELS_DIR
+    refresh_models_btn.click(
+        fn=lambda: gr.update(choices=list_models()),
+        outputs=[model_dropdown],
+    )
+
+    # Timer: also updates dropdown when a new model finishes training
+    gr.Timer(10).tick(
+        fn=get_progress,
+        outputs=[status_box, log_box, open_btn, model_dropdown],
+    )
 
 
 if __name__ == "__main__":
