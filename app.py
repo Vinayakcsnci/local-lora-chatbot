@@ -131,7 +131,7 @@ class _LogCallback(TrainerCallback):
 
 # ── Background training worker ─────────────────────────────────────────────────
 
-def _worker(pdf_bytes: bytes, project_name: str):
+def _worker(all_pdf_bytes: list[bytes], project_name: str):
     _state.update({
         "log_lines": [], "error": None, "qa_count": 0,
         "phase": "training", "progress": 0.0,
@@ -140,10 +140,14 @@ def _worker(pdf_bytes: bytes, project_name: str):
     tmp_dir    = os.path.join(MODELS_DIR, f"_tmp_{project_name}")
 
     try:
-        # 1. Extract PDF
-        _log_q.put("Extracting text from PDF...")
-        pages = extract_pages(pdf_bytes)
-        _log_q.put(f"Extracted {len(pages)} page(s).")
+        # 1. Extract all PDFs and merge pages
+        _log_q.put(f"Extracting text from {len(all_pdf_bytes)} PDF(s)...")
+        pages = []
+        for idx, pdf_bytes in enumerate(all_pdf_bytes, 1):
+            doc_pages = extract_pages(pdf_bytes)
+            _log_q.put(f"  PDF {idx}: {len(doc_pages)} page(s)")
+            pages.extend(doc_pages)
+        _log_q.put(f"Total: {len(pages)} page(s) across {len(all_pdf_bytes)} file(s).")
 
         # 2. Q&A via Ollama
         _log_q.put(f"Generating Q&A pairs with Ollama ({OLLAMA_MODEL})...")
@@ -294,11 +298,15 @@ def chat_fn(message: str, history: list[dict]):
 
 # ── Gradio handlers (all return immediately) ───────────────────────────────────
 
-def start_training(pdf_file, project_name_input):
-    if pdf_file is None:
-        return gr.update(), "Please upload a PDF file."
+def start_training(pdf_files, project_name_input):
+    if not pdf_files:
+        return gr.update(), "Please upload at least one PDF file."
     if _state["phase"] == "training":
         return gr.update(), "Training already running — check the Progress tab."
+
+    # Normalise to list (Gradio may pass a single path string or a list)
+    if isinstance(pdf_files, (str, bytes)):
+        pdf_files = [pdf_files]
 
     name = (project_name_input or "").strip().replace(" ", "-").lower()
     if not name:
@@ -306,10 +314,16 @@ def start_training(pdf_file, project_name_input):
         name = f"model-{uuid.uuid4().hex[:6]}"
 
     _state["project_name"] = name
-    pdf_bytes = open(pdf_file, "rb").read() if isinstance(pdf_file, str) else pdf_file
-    threading.Thread(target=_worker, args=(pdf_bytes, name), daemon=True).start()
 
-    return gr.update(selected="progress"), f"Started '{name}'. Switch to the Progress tab."
+    # Read all PDFs into memory before spawning the thread
+    all_bytes = []
+    for f in pdf_files:
+        all_bytes.append(open(f, "rb").read() if isinstance(f, str) else f)
+
+    threading.Thread(target=_worker, args=(all_bytes, name), daemon=True).start()
+
+    n = len(all_bytes)
+    return gr.update(selected="progress"), f"Started '{name}' with {n} PDF(s). Switch to the Progress tab."
 
 
 def get_progress():
@@ -324,7 +338,7 @@ def get_progress():
         status = f"ERROR: {err}"
         ready  = False
     elif phase == "upload":
-        status = "Idle — upload a PDF to begin."
+        status = "Idle — upload PDF(s) to begin."
         ready  = False
     elif phase == "training":
         status = (
@@ -357,10 +371,15 @@ with gr.Blocks(title="Local LoRA Chatbot") as demo:
         # Tab 1 — Upload
         with gr.Tab("Step 1 — Upload & Train", id="upload"):
             gr.Markdown(
-                "Upload a PDF. Ollama will generate Q&A pairs from it, "
-                "then LoRA fine-tuning runs locally. Expect **10–30 min** on CPU."
+                "Upload one or more PDFs. Ollama generates Q&A pairs from all of them, "
+                "then LoRA fine-tuning runs locally on the combined dataset. "
+                "Expect **10–30 min** on CPU."
             )
-            pdf_input  = gr.File(label="PDF file", file_types=[".pdf"])
+            pdf_input  = gr.File(
+                label="PDF files (select multiple)",
+                file_types=[".pdf"],
+                file_count="multiple",
+            )
             proj_input = gr.Textbox(
                 label="Model name (blank = auto)", placeholder="my-qa-model"
             )
